@@ -247,6 +247,31 @@ void Util::addBytes( string function, size_t size )
     }
 }
 
+
+pthread_mutex_t gz_map_mux;
+int gzcounter = 0;
+HASH_MAP<int, gzFile> gz_map;
+
+int
+Util::add_gz_map(gzFile gfd){
+    typedef pair <int, gzFile> Gz_Pair;
+    pthread_mutex_lock( &gz_map_mux );
+    gzcounter++;
+    if (gzcounter < 3){
+        gzcounter = 3;
+    }
+    pthread_mutex_unlock( &gz_map_mux );
+
+    gz_map.insert(Gz_Pair(gzcounter, gfd));
+    return gzcounter;
+}
+
+int
+Util::remove_gz_map(int fd){
+    gz_map.erase(fd);
+    return 0;
+}
+
 // just reads through a directory and returns all descendants
 // useful for gathering the contents of a container
 int

@@ -16,6 +16,7 @@
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
 #endif
+#include <zlib.h>
 #include <sys/dir.h>
 #include <dirent.h>
 #include <sys/syscall.h>
@@ -126,6 +127,9 @@ class Util
                                          off_t *, off_t *, double * );
         static string bandwidthToString( HASH_MAP<string,double>::iterator,
                                          HASH_MAP<string,off_t>::iterator );
+
+        static int add_gz_map(gzFile);
+        static int remove_gz_map(int);
 };
 
 #endif
