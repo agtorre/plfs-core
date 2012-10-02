@@ -6,6 +6,7 @@
 #include <errno.h>
 #include "COPYRIGHT.h"
 #include <string>
+#include <assert.h>
 #include <fstream>
 #include <iostream>
 #include <sys/dir.h>
@@ -44,6 +45,19 @@ using namespace std;
 #define SLOW_UTIL   2
 
 #define O_CONCURRENT_WRITE                         020000000000
+
+
+// here is some code to enable transparent gzipping of file IO
+enum IOType {
+    POSIX_IO,
+    GNU_IO,
+    GZIP_IO,
+};
+
+IOType iotype = POSIX_IO;    // which IO type to use
+pthread_mutex_t handle_map_mux = PTHREAD_MUTEX_INITIALIZER;
+int available_handle = 0;
+HASH_MAP<int, void *> handle_map;
 
 // TODO.  Some functions in here return -errno.  Probably none of them
 // should
@@ -248,29 +262,57 @@ void Util::addBytes( string function, size_t size )
 }
 
 
-pthread_mutex_t gz_map_mux;
-int gzcounter = 0;
-HASH_MAP<int, gzFile> gz_map;
+/*
 
+   // we don't need this code anymore since we still use posix open and then
+   // use gzdopen and can use fdopen if we want glib
+
+// small utility to allow swapping in gzip or FILE IO
+// will be replaced by iostore but this is simple way to test with old branches
+// returns a positive fd or -errno
 int
-Util::add_gz_map(gzFile gfd){
-    typedef pair <int, gzFile> Gz_Pair;
-    pthread_mutex_lock( &gz_map_mux );
-    gzcounter++;
-    if (gzcounter < 3){
-        gzcounter = 3;
-    }
-    pthread_mutex_unlock( &gz_map_mux );
+Util::add_file_handle(void *handle){
 
-    gz_map.insert(Gz_Pair(gzcounter, gfd));
-    return gzcounter;
+    // use to make sure it got inserted
+    pair<map<char,void *>::iterator,bool> ret;
+
+    // use a counter for the hopefully impossible case in which we have no
+    // available slots available to store a new gzfile
+    int start_value = available_handle;
+    bool inserted = false;
+    pthread_mutex_lock( &handle_map_mux );
+    do {
+        available_handle++;
+        if (available_handle < 3){ // cannot be negative or any of the STD's
+            available_handle = 3;
+        }
+        handle_map.insert(pair<int,void*>(available_handle, handle));
+        if (ret.second==true) {
+            mlog(UT_DAPI, "%s found fd slot %d",__FUNCTION__, available_handle);
+            inserted = true;
+            break;
+        }
+    } while (start_value != available_handle );
+    pthread_mutex_unlock( &handle_map_mux );
+
+    // boy, I hope this never happens
+    if ( ! inserted ) {
+        mlog(UT_CRIT, "WTF: %s failed with no available fd slots",__FUNCTION__);
+        return -EMFILE;
+    }
+
+    // success
+    return available_handle;
 }
 
 int
-Util::remove_gz_map(int fd){
-    gz_map.erase(fd);
+Util::remove_file_handle(int fd){
+    pthread_mutex_lock( &handle_map_mux );
+    handle_map.erase(fd);
+    pthread_mutex_unlock( &handle_map_mux );
     return 0;
 }
+*/
 
 // just reads through a directory and returns all descendants
 // useful for gathering the contents of a container
@@ -403,14 +445,54 @@ int Util::MutexUnlock( pthread_mutex_t *mux, const char *where )
 ssize_t Util::Pread( int fd, void *buf, size_t size, off_t off )
 {
     ENTER_IO;
-    ret = pread( fd, buf, size, off );
+    switch(iotype) {
+        case POSIX_IO:
+            ret = pread( fd, buf, size, off );
+            break;
+        case GZIP_IO:
+            {
+                // just seek it and use the existing function
+                gzFile gz = (void*)handle_map[fd];
+                z_off_t offset = gzseek(gz, off, SEEK_SET);
+                if (offset == off) {
+                    ret = Read(fd,buf,size); 
+                } else {
+                    ret = (errno==0?-EIO:-errno);
+                }
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_IO;
 }
 
 ssize_t Util::Pwrite( int fd, const void *buf, size_t size, off_t off )
 {
     ENTER_IO;
-    ret = pwrite( fd, buf, size, off );
+    switch(iotype) {
+        case POSIX_IO:
+            ret = pwrite( fd, buf, size, off );
+            break;
+        case GZIP_IO:
+            {
+                // just seek it and use the existing function
+                gzFile gz = (void*)handle_map[fd];
+                z_off_t offset = gzseek(gz, off, SEEK_SET);
+                if (offset == off) {
+                    ret = Write(fd,buf,size); 
+                } else {
+                    ret = (errno==0?-EIO:-errno);
+                }
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_IO;
 }
 
@@ -546,21 +628,71 @@ int Util::Symlink( const char *path, const char *to )
 ssize_t Util::Read( int fd, void *buf, size_t size)
 {
     ENTER_IO;
-    ret = read( fd, buf, size );
+    switch(iotype) {
+        case POSIX_IO:
+            ret = read( fd, buf, size );
+            break;
+        case GZIP_IO:
+            {
+                gzFile gz = (void*)handle_map[fd];
+                ret = gzread(gz,buf,size);
+                if (ret < 0) {
+                    ret = (errno==0?-EIO:-errno);
+                }
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_IO;
 }
 
 ssize_t Util::Write( int fd, const void *buf, size_t size)
 {
     ENTER_IO;
-    ret = write( fd, buf, size );
+    switch(iotype) {
+        case POSIX_IO:
+            ret = write( fd, buf, size );
+            break;
+        case GZIP_IO:
+            {
+                gzFile gz = (void*)handle_map[fd];
+                ret = gzwrite(gz,buf,size);
+                if (ret < 0) {
+                    ret = (errno==0?-EIO:-errno);
+                }
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_IO;
 }
 
 int Util::Close( int fd )
 {
     ENTER_UTIL;
-    ret = close( fd );
+    switch(iotype) {
+        case POSIX_IO:
+            ret = close(fd);
+            break;
+        case GZIP_IO:
+            {
+                gzFile gz = (void*)handle_map[fd];
+                ret = gzclose(gz);
+                handle_map.erase(fd);
+                ret = (ret == Z_OK?0:errno==0?-EIO:-errno);
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_UTIL;
 }
 
@@ -626,39 +758,156 @@ int Util::Closedir( DIR *dp )
 int Util::Munmap(void *addr,size_t len)
 {
     ENTER_UTIL;
-    ret = munmap(addr,len);
+    switch(iotype) {
+        case POSIX_IO:
+            ret = munmap(addr,len);
+            break;
+        case GZIP_IO:
+            {
+                free(addr);
+                ret = 0;
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_UTIL;
 }
 
-int Util::Mmap( size_t len, int fildes, void **retaddr)
+int Util::Mmap( size_t len, int fd, void **retaddr)
 {
     ENTER_UTIL;
-    int prot  = PROT_READ;
-    int flags = MAP_PRIVATE|MAP_NOCACHE;
-    *retaddr = mmap( NULL, len, prot, flags, fildes, 0 );
-    ret = ( *retaddr == (void *)NULL || *retaddr == (void *)-1 ? -1 : 0 );
+    switch(iotype) {
+        case POSIX_IO:
+            {
+                int prot  = PROT_READ;
+                int flags = MAP_PRIVATE|MAP_NOCACHE;
+                *retaddr = mmap( NULL, len, prot, flags, fd, 0 );
+                ret = (*retaddr == (void *)NULL || *retaddr ==(void *)-1 ?-1:0);
+            }
+            break;
+        case GZIP_IO:
+            {
+                // fake mmap by mallocing a buf and reading into it
+                *retaddr = malloc(len);
+                if (*retaddr == NULL) {
+                    ret = -errno;
+                } else {
+                    ret = Read(fd,*retaddr,len);
+                    if (ret > 0) {
+                        ret = 0;
+                    }
+                }
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_UTIL;
 }
 
-int Util::Lseek( int fildes, off_t offset, int whence, off_t *result )
+int Util::Lseek( int fd, off_t offset, int whence, off_t *result )
 {
     ENTER_UTIL;
-    *result = lseek( fildes, offset, whence );
+    switch(iotype) {
+        case POSIX_IO:
+            *result = lseek( fd, offset, whence );
+            break;
+        case GZIP_IO:
+            {
+                // just seek it and use the existing function
+                gzFile gz = (void*)handle_map[fd];
+                z_off_t off = gzseek(gz, offset, whence);
+                *result = (off_t)off;
+            }
+            break;
+        case GNU_IO:
+        default:
+            *result = -ENOSYS;
+            break;
+    }
     ret = (int)*result;
     EXIT_UTIL;
+}
+
+// helper function to convert flags for POSIX open
+// into restrict_mode as used in glib fopen
+string
+flags_to_mode(int flags) {
+    if (flags & O_RDONLY) {
+        return "r";
+    } else if (flags & O_WRONLY) {
+        return "w";
+    } else {
+        assert (flags & O_RDWR);
+        return "r+"; 
+    }
+    assert(0);
+    return "";
 }
 
 int Util::Open( const char *path, int flags )
 {
     ENTER_PATH;
-    ret = open( path, flags );
+    // first do the regular open
+    int fd = open( path, flags );
+
+    switch(iotype) {
+        case POSIX_IO:
+            ret = fd;
+            break;
+        case GZIP_IO:
+            {
+                string mode = flags_to_mode(flags);
+                gzFile gz = gzdopen(fd, mode.c_str());
+                if (gz == Z_NULL) {
+                    ret = -EIO;
+                } else {
+                    handle_map[fd] = (void*)gz;
+                    ret = fd; 
+                }
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_UTIL;
 }
 
 int Util::Open( const char *path, int flags, mode_t mode )
 {
     ENTER_PATH;
-    ret = open( path, flags, mode );
+
+    // first do the regular open
+    int fd = open( path, flags, mode );
+
+    switch(iotype) {
+        case POSIX_IO:
+            ret = fd;
+            break;
+        case GZIP_IO:
+            {
+                string mode = flags_to_mode(flags);
+                gzFile gz = gzdopen(fd, mode.c_str());
+                if (gz == Z_NULL) {
+                    ret = -EIO;
+                } else {
+                    handle_map[fd] = (void*)gz;
+                    ret = fd; 
+                }
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_UTIL;
 }
 
@@ -733,7 +982,26 @@ int Util::Filesize(const char *path)
 int Util::Fsync( int fd)
 {
     ENTER_UTIL;
-    ret = fsync( fd );
+    switch(iotype) {
+        case POSIX_IO:
+            ret = fsync( fd );
+            break;
+        case GZIP_IO:
+            {
+                gzFile gz = (void*)handle_map[fd];
+                ret = gzflush(gz,Z_FINISH);
+                if (ret == Z_OK) {
+                    ret = 0;
+                } else {
+                    ret = (errno==0?-EIO:-errno);
+                }
+            }
+            break;
+        case GNU_IO:
+        default:
+            ret = -ENOSYS;
+            break;
+    }
     EXIT_UTIL;
 }
 
@@ -938,6 +1206,10 @@ int Util::Stat(const char *path, struct stat *file_info)
 int Util::Fstat(int fd, struct stat *file_info)
 {
     ENTER_UTIL;
+    // just use the fd, but if GZIP_IO or GNU_IO, flush first
+    if (iotype == GZIP_IO || iotype == GNU_IO) {
+        Fsync(fd);
+    }
     ret = fstat(fd, file_info);
     EXIT_UTIL;
 }
@@ -945,6 +1217,10 @@ int Util::Fstat(int fd, struct stat *file_info)
 int Util::Ftruncate(int fd, off_t offset)
 {
     ENTER_UTIL;
+    // just use the fd, but if GZIP_IO or GNU_IO, flush first
+    if (iotype == GZIP_IO || iotype == GNU_IO) {
+        Fsync(fd);
+    }
     ret = ftruncate(fd, offset);
     EXIT_UTIL;
 }

@@ -66,7 +66,7 @@ class Util
         static uid_t Getuid();
         static gid_t Getgid();
         static int Link(const char *,const char *);
-        static int Lseek( int fildes, off_t offset, int whence, off_t *result );
+        static int Lseek( int fd, off_t offset, int whence, off_t *result );
         static int Lstat( const char *, struct stat * );
         static int Mkdir( const char *, mode_t );
         static int Mknod( const char *path, mode_t mode, dev_t dev );
@@ -128,8 +128,8 @@ class Util
         static string bandwidthToString( HASH_MAP<string,double>::iterator,
                                          HASH_MAP<string,off_t>::iterator );
 
-        static int add_gz_map(gzFile);
-        static int remove_gz_map(int);
+        static int add_file_handle(void *);
+        static int remove_file_handle(int);
 };
 
 #endif
