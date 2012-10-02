@@ -54,10 +54,10 @@ enum IOType {
     GZIP_IO,
 };
 
-IOType iotype = POSIX_IO;    // which IO type to use
+IOType iotype = GZIP_IO;    // which IO type to use
 pthread_mutex_t handle_map_mux = PTHREAD_MUTEX_INITIALIZER;
 int available_handle = 0;
-HASH_MAP<int, void *> handle_map;
+HASH_MAP<int, gzFile> gz_handle_map;
 
 // TODO.  Some functions in here return -errno.  Probably none of them
 // should
@@ -452,7 +452,7 @@ ssize_t Util::Pread( int fd, void *buf, size_t size, off_t off )
         case GZIP_IO:
             {
                 // just seek it and use the existing function
-                gzFile gz = (void*)handle_map[fd];
+                gzFile gz = (gzFile)gz_handle_map[fd];
                 z_off_t offset = gzseek(gz, off, SEEK_SET);
                 if (offset == off) {
                     ret = Read(fd,buf,size); 
@@ -479,7 +479,7 @@ ssize_t Util::Pwrite( int fd, const void *buf, size_t size, off_t off )
         case GZIP_IO:
             {
                 // just seek it and use the existing function
-                gzFile gz = (void*)handle_map[fd];
+                gzFile gz = (gzFile)gz_handle_map[fd];
                 z_off_t offset = gzseek(gz, off, SEEK_SET);
                 if (offset == off) {
                     ret = Write(fd,buf,size); 
@@ -634,7 +634,7 @@ ssize_t Util::Read( int fd, void *buf, size_t size)
             break;
         case GZIP_IO:
             {
-                gzFile gz = (void*)handle_map[fd];
+                gzFile gz = (gzFile)gz_handle_map[fd];
                 ret = gzread(gz,buf,size);
                 if (ret < 0) {
                     ret = (errno==0?-EIO:-errno);
@@ -658,7 +658,7 @@ ssize_t Util::Write( int fd, const void *buf, size_t size)
             break;
         case GZIP_IO:
             {
-                gzFile gz = (void*)handle_map[fd];
+                gzFile gz = (gzFile)gz_handle_map[fd];
                 ret = gzwrite(gz,buf,size);
                 if (ret < 0) {
                     ret = (errno==0?-EIO:-errno);
@@ -682,9 +682,9 @@ int Util::Close( int fd )
             break;
         case GZIP_IO:
             {
-                gzFile gz = (void*)handle_map[fd];
+                gzFile gz = (gzFile)gz_handle_map[fd];
                 ret = gzclose(gz);
-                handle_map.erase(fd);
+                gz_handle_map.erase(fd);
                 ret = (ret == Z_OK?0:errno==0?-EIO:-errno);
             }
             break;
@@ -791,6 +791,7 @@ int Util::Mmap( size_t len, int fd, void **retaddr)
         case GZIP_IO:
             {
                 // fake mmap by mallocing a buf and reading into it
+                mlog(UT_DAPI, "Faking mmap for length %ld", len);
                 *retaddr = malloc(len);
                 if (*retaddr == NULL) {
                     ret = -errno;
@@ -810,6 +811,64 @@ int Util::Mmap( size_t len, int fd, void **retaddr)
     EXIT_UTIL;
 }
 
+// returns size or -errno
+size_t gzip_uncompressed_size(FILE *fp) {
+    // Look at the first two bytes and make sure it's a gzip file
+    int c1 = fgetc(fp);
+    int c2 = fgetc(fp);
+    if ( c1 != 0x1f || c2 != 0x8b ) {
+        return -EIO;
+    }
+
+
+    // Seek to four bytes from the end of the file
+    fseek(fp, -4L, SEEK_END);
+
+    // Array containing the last four bytes
+    unsigned char read[4];
+
+    for (int i=0; i<4; ++i ) {
+        int charRead = 0;
+        if ((charRead = fgetc(fp)) == EOF ) {
+            return -EIO;
+        } else {
+            read[i] = (unsigned char)charRead;
+        }
+    }
+
+    // Copy the last four bytes into an int.  This could also be done
+    // using a union.
+    int intval = 0;
+    memcpy( &intval, &read, 4 );
+
+    mlog(UT_DAPI, "Found size of gzip file: %ld", (long int)intval); 
+    return intval;
+}
+
+size_t gzip_uncompressed_size(int fd) {
+    FILE *fp;
+    fp = fdopen(dup(fd), "r"); // dup it so fclose won't close it
+    if (fp == NULL) {
+        return -errno;
+    }
+    size_t ret = gzip_uncompressed_size(fp);
+    fclose(fp);
+    return ret;
+}
+
+// returns size of the uncompressed data or -errno
+// only works for files smaller than 4GB....
+size_t gzip_uncompressed_size(const char *path) {
+    FILE *fp;
+    size_t ret;
+    if (( fp = fopen( path, "r" )) == NULL ) {
+        return -errno;
+    }
+    ret = gzip_uncompressed_size(fp);
+    fclose(fp);
+    return ret;
+}
+
 int Util::Lseek( int fd, off_t offset, int whence, off_t *result )
 {
     ENTER_UTIL;
@@ -819,9 +878,17 @@ int Util::Lseek( int fd, off_t offset, int whence, off_t *result )
             break;
         case GZIP_IO:
             {
-                // just seek it and use the existing function
-                gzFile gz = (void*)handle_map[fd];
+                gzFile gz = (gzFile)gz_handle_map[fd];
+                if (whence == SEEK_END) {
+                    // gzseek doesn't support SEEK_END so we have to
+                    // figure it out ourselves
+                    // then seek to end and change whence to SEEK_CUR
+                    size_t sz = gzip_uncompressed_size(fd);          
+                    gzseek(gz, sz, SEEK_SET); 
+                    whence = SEEK_CUR; 
+                }
                 z_off_t off = gzseek(gz, offset, whence);
+                mlog(UT_DAPI, "gzseek got %ld", (long int)off);
                 *result = (off_t)off;
             }
             break;
@@ -838,7 +905,8 @@ int Util::Lseek( int fd, off_t offset, int whence, off_t *result )
 // into restrict_mode as used in glib fopen
 string
 flags_to_mode(int flags) {
-    if (flags & O_RDONLY) {
+    if (flags & O_RDONLY || flags == O_RDONLY) {
+        // tougher to check for O_RDONLY since it is 0
         return "r";
     } else if (flags & O_WRONLY) {
         return "w";
@@ -867,7 +935,7 @@ int Util::Open( const char *path, int flags )
                 if (gz == Z_NULL) {
                     ret = -EIO;
                 } else {
-                    handle_map[fd] = (void*)gz;
+                    gz_handle_map[fd] = gz;
                     ret = fd; 
                 }
             }
@@ -898,7 +966,7 @@ int Util::Open( const char *path, int flags, mode_t mode )
                 if (gz == Z_NULL) {
                     ret = -EIO;
                 } else {
-                    handle_map[fd] = (void*)gz;
+                    gz_handle_map[fd] = (void*)gz;
                     ret = fd; 
                 }
             }
@@ -988,7 +1056,7 @@ int Util::Fsync( int fd)
             break;
         case GZIP_IO:
             {
-                gzFile gz = (void*)handle_map[fd];
+                gzFile gz = (gzFile)gz_handle_map[fd];
                 ret = gzflush(gz,Z_FINISH);
                 if (ret == Z_OK) {
                     ret = 0;
@@ -1199,7 +1267,14 @@ char *Util::hostname()
 int Util::Stat(const char *path, struct stat *file_info)
 {
     ENTER_PATH;
+    // first stat the file
     ret = stat( path , file_info );
+
+    // if we are using gzip files, we need to get uncompressed filesize 
+    if (iotype == GZIP_IO) {
+        file_info->st_size = gzip_uncompressed_size(path);
+        ret = (file_info->st_size > 0 ? 0 : file_info->st_size);
+    }
     EXIT_UTIL;
 }
 
@@ -1211,6 +1286,12 @@ int Util::Fstat(int fd, struct stat *file_info)
         Fsync(fd);
     }
     ret = fstat(fd, file_info);
+
+    // if we are using gzip files, we need to get uncompressed filesize 
+    if (iotype == GZIP_IO) {
+        file_info->st_size = gzip_uncompressed_size(fd);
+        ret = (file_info->st_size > 0 ? 0 : file_info->st_size);
+    }
     EXIT_UTIL;
 }
 
