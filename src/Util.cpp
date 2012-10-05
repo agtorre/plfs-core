@@ -57,7 +57,16 @@ enum IOType {
 IOType iotype = GZIP_IO;    // which IO type to use
 pthread_mutex_t handle_map_mux = PTHREAD_MUTEX_INITIALIZER;
 int available_handle = 0;
-map<int, gzFile> gz_handle_map;
+typedef struct GZ_File_struct {
+    gzFile gz;
+    string path;
+    int flags;
+    int fd;
+    mode_t mode;
+    string oflags;
+} GZ_File;
+
+map<int, GZ_File*> gz_handle_map;
 
 // TODO.  Some functions in here return -errno.  Probably none of them
 // should
@@ -149,6 +158,24 @@ vector<string> &Util::tokenize(const string& str,const string& delimiters,
         pos = str.find_first_of(delimiters, lastPos);
     }
     return tokens;
+}
+
+gzFile 
+get_gzfile(int fd, const char *function) {
+    map<int,GZ_File*>::iterator search_itr;
+    search_itr = gz_handle_map.find(fd);
+    if (search_itr == gz_handle_map.end()) {
+        mlog(UT_DAPI, "gzwrite wtf can't find file for %d from %s\n", fd, function); 
+        return Z_NULL;
+    } else {
+        assert(fd == search_itr->second->fd);
+        mlog(UT_DAPI, "gzwrite lookup from %s found open gz file %d (%d:%s) -> %s\n", 
+            function, fd, 
+            search_itr->second->flags, search_itr->second->oflags.c_str(), 
+            search_itr->second->path.c_str());
+        return search_itr->second->gz;
+    }
+    
 }
 
 void
@@ -452,7 +479,7 @@ ssize_t Util::Pread( int fd, void *buf, size_t size, off_t off )
         case GZIP_IO:
             {
                 // just seek it and use the existing function
-                gzFile gz = (gzFile)gz_handle_map[fd];
+                gzFile gz = get_gzfile(fd,__FUNCTION__);
                 z_off_t offset = gzseek(gz, off, SEEK_SET);
                 if (offset == off) {
                     ret = Read(fd,buf,size); 
@@ -479,7 +506,7 @@ ssize_t Util::Pwrite( int fd, const void *buf, size_t size, off_t off )
         case GZIP_IO:
             {
                 // just seek it and use the existing function
-                gzFile gz = (gzFile)gz_handle_map[fd];
+                gzFile gz = get_gzfile(fd,__FUNCTION__);
                 z_off_t offset = gzseek(gz, off, SEEK_SET);
                 if (offset == off) {
                     ret = Write(fd,buf,size); 
@@ -638,7 +665,7 @@ ssize_t Util::Read( int fd, void *buf, size_t size)
             break;
         case GZIP_IO:
             {
-                gzFile gz = (gzFile)gz_handle_map[fd];
+                gzFile gz = get_gzfile(fd,__FUNCTION__);
                 //gzseek(gz, 0, SEEK_SET);
                 ret = gzread(gz,buf,size);
                 mlog(UT_DAPI, "gzwrite read from fd %d size %ld ret %ld", fd, size, ret);
@@ -663,7 +690,7 @@ ssize_t Util::Read( int fd, void *buf, size_t size)
 string
 flags_to_mode(int flags) {
     string ret_str;
-    string compresslevel = "0";
+    string compresslevel = "";
     if (flags & O_RDONLY || flags == O_RDONLY) {
         // tougher to check for O_RDONLY since it is 0
         ret_str = "r";
@@ -679,18 +706,28 @@ flags_to_mode(int flags) {
 
 int gz_open(int fd, const char *path, int flags) {
     int ret = -ENOSYS;
-    string mode = flags_to_mode(flags);
+    if (fd <= 0) {
+        return fd;
+    }
+    string gz_oflags = flags_to_mode(flags);
     mlog(UT_DAPI, "gzwrite %s on fd %d path %s: %d -> %s (%s)\n", "flags_to_mode", fd, path, flags, 
-        mode.c_str(), Util::openFlagsToString(flags).c_str());
-    gzFile gz = gzdopen(fd, mode.c_str());
+        gz_oflags.c_str(), Util::openFlagsToString(flags).c_str());
+    gzFile gz = gzdopen(fd, gz_oflags.c_str());
     if (gz != Z_NULL) {
-        map<int,gzFile>::iterator search_itr;
+        map<int,GZ_File*>::iterator search_itr;
         search_itr = gz_handle_map.find(fd);
         if (search_itr != gz_handle_map.end()) {
             mlog(UT_DAPI, "gzwrite wtf trying to add fd %d for path %s but one already there\n", fd, path);
         }
-        pair<map<int,gzFile>::iterator,bool> insert_ret;
-        insert_ret = gz_handle_map.insert(pair<int,gzFile>(fd,gz));
+        
+        pair<map<int,GZ_File*>::iterator,bool> insert_ret;
+        GZ_File *GZ = new GZ_File;
+        GZ->gz = gz;
+        GZ->path = path;
+        GZ->flags = flags;
+        GZ->oflags = gz_oflags;
+        GZ->fd = fd;
+        insert_ret = gz_handle_map.insert(pair<int,GZ_File*>(fd,GZ));
         assert(insert_ret.second);
         print_gz(gz,__LINE__);
         mlog(UT_DAPI, "gzwrite added fd %d %s: %p", fd, path, &gz);
@@ -711,8 +748,8 @@ ssize_t Util::Write( int fd, const void *buf, size_t size)
             break;
         case GZIP_IO:
             {
-                gz_handle_map[fd] = gzdopen(fd,flags_to_mode(521).c_str());
-                gzFile gz = gz_handle_map[fd];
+                //gz_handle_map[fd] = gzdopen(fd,flags_to_mode(521).c_str());
+                gzFile gz = get_gzfile(fd,__FUNCTION__);
                 //gzFile gz2 = gzdopen(dup(fd),flags_to_mode(521).c_str());
                 ret = gzwrite(gz, buf,size);
                 print_gz(gz,__LINE__);
@@ -724,6 +761,13 @@ ssize_t Util::Write( int fd, const void *buf, size_t size)
                     //int gz_error;
                     //mlog(UT_DAPI, "gzwrite error: %s\n", gzerror(gz, &gz_error));
                     ret = (errno==0?-EIO:-errno);
+                }
+                if ((size_t)ret != size) {
+                    mlog(UT_DAPI, "gzwrite wrote FAIL to fd %d sz %ld ret = %ld gzerr = \"%s\"",
+                            fd, size, ret, gzerror(gz, &gz_errno));
+                    assert(0);
+                    mlog(UT_DAPI, "htf could I exist after an assert?");
+                    exit(-1);
                 }
             }
             break;
@@ -744,15 +788,19 @@ int Util::Close( int fd )
             break;
         case GZIP_IO:
             {
-                gzFile gz = gz_handle_map[fd];
+                int ret2;
+                gzFile gz = get_gzfile(fd,__FUNCTION__);
                 print_gz(gz,__LINE__);
+                ret2 = gzflush(gz,Z_FINISH);
                 ret = gzclose(gz);
-                mlog(UT_DAPI, "gzwrite removing fd %d ret %d", fd, ret);
+                mlog(UT_DAPI, "gzwrite removing fd %d flush %d ret %d", fd, ret2, ret);
+                free(gz_handle_map[fd]);
                 size_t removed = gz_handle_map.erase(fd);
                 if (removed != 1) {
                     mlog(UT_DAPI, "gzwrite wtf trying to remove fd %d but couldn't\n", fd);
                 }
                 ret = (ret == Z_OK?0:errno==0?-EIO:-errno);
+                
             }
             break;
         case GNU_IO:
@@ -970,7 +1018,7 @@ int Util::Lseek( int fd, off_t offset, int whence, off_t *result )
             break;
         case GZIP_IO:
             {
-                gzFile gz = (gzFile)gz_handle_map[fd];
+                gzFile gz = get_gzfile(fd,__FUNCTION__);
                 if (whence == SEEK_END) {
                     // gzseek doesn't support SEEK_END so we have to
                     // figure it out ourselves
@@ -1197,8 +1245,9 @@ int Util::Fsync( int fd)
             break;
         case GZIP_IO:
             {
-                gzFile gz = (gzFile)gz_handle_map[fd];
-                ret = gzflush(gz,Z_FINISH);
+                gzFile gz = get_gzfile(fd,__FUNCTION__);
+                print_gz(gz,__LINE__);
+                ret = gzflush(gz,Z_FULL_FLUSH);
                 if (ret == Z_OK) {
                     ret = 0;
                 } else {
