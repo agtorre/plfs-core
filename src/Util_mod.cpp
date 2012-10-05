@@ -57,7 +57,7 @@ enum IOType {
 IOType iotype = GZIP_IO;    // which IO type to use
 pthread_mutex_t handle_map_mux = PTHREAD_MUTEX_INITIALIZER;
 int available_handle = 0;
-map<int, gzFile> gz_handle_map;
+HASH_MAP<int, gzFile> gz_handle_map;
 
 // TODO.  Some functions in here return -errno.  Probably none of them
 // should
@@ -625,10 +625,6 @@ int Util::Symlink( const char *path, const char *to )
     EXIT_UTIL;
 }
 
-void print_gz(gzFile gz, int line) {
-    //mlog(UT_DAPI, "gzwrite gz from %d is %p, %p, %d\n", line, gz, &gz, *(char*)gz);
-}
-
 ssize_t Util::Read( int fd, void *buf, size_t size)
 {
     ENTER_IO;
@@ -639,11 +635,7 @@ ssize_t Util::Read( int fd, void *buf, size_t size)
         case GZIP_IO:
             {
                 gzFile gz = (gzFile)gz_handle_map[fd];
-                //gzseek(gz, 0, SEEK_SET);
                 ret = gzread(gz,buf,size);
-                mlog(UT_DAPI, "gzwrite read from fd %d size %ld ret %ld", fd, size, ret);
-                print_gz(gz, __LINE__);
-                
                 if (ret < 0) {
                     ret = (errno==0?-EIO:-errno);
                 }
@@ -657,51 +649,6 @@ ssize_t Util::Read( int fd, void *buf, size_t size)
     EXIT_IO;
 }
 
-
-// helper function to convert flags for POSIX open
-// into restrict_mode as used in glib fopen
-string
-flags_to_mode(int flags) {
-    string ret_str;
-    string compresslevel = "0";
-    if (flags & O_RDONLY || flags == O_RDONLY) {
-        // tougher to check for O_RDONLY since it is 0
-        ret_str = "r";
-    } else if (flags & O_WRONLY) {
-        ret_str = "w";
-    } else {
-        assert (flags & O_RDWR);
-        ret_str = "r+"; 
-    }
-    ret_str += compresslevel; 
-    return ret_str;
-}
-
-int gz_open(int fd, const char *path, int flags) {
-    int ret = -ENOSYS;
-    string mode = flags_to_mode(flags);
-    mlog(UT_DAPI, "gzwrite %s on fd %d path %s: %d -> %s (%s)\n", "flags_to_mode", fd, path, flags, 
-        mode.c_str(), Util::openFlagsToString(flags).c_str());
-    gzFile gz = gzdopen(fd, mode.c_str());
-    if (gz != Z_NULL) {
-        map<int,gzFile>::iterator search_itr;
-        search_itr = gz_handle_map.find(fd);
-        if (search_itr != gz_handle_map.end()) {
-            mlog(UT_DAPI, "gzwrite wtf trying to add fd %d for path %s but one already there\n", fd, path);
-        }
-        pair<map<int,gzFile>::iterator,bool> insert_ret;
-        insert_ret = gz_handle_map.insert(pair<int,gzFile>(fd,gz));
-        assert(insert_ret.second);
-        print_gz(gz,__LINE__);
-        mlog(UT_DAPI, "gzwrite added fd %d %s: %p", fd, path, &gz);
-        ret = fd;
-    } else {
-        mlog(UT_DAPI, "gzwrite gzdopen failed on fd %d path %s\n", fd, path); 
-        ret = -EIO;
-    }
-    return ret;
-}
-
 ssize_t Util::Write( int fd, const void *buf, size_t size)
 {
     ENTER_IO;
@@ -711,18 +658,13 @@ ssize_t Util::Write( int fd, const void *buf, size_t size)
             break;
         case GZIP_IO:
             {
-                gz_handle_map[fd] = gzdopen(fd,flags_to_mode(521).c_str());
-                gzFile gz = gz_handle_map[fd];
-                //gzFile gz2 = gzdopen(dup(fd),flags_to_mode(521).c_str());
-                ret = gzwrite(gz, buf,size);
-                print_gz(gz,__LINE__);
-                int gz_errno;
-                mlog(UT_DAPI, "gzwrite wrote to fd %d sz %ld ret = %ld gzerr = \"%s\"",
-                            fd, size, ret, gzerror(gz, &gz_errno));
-                //gzclose(gz2);
+                gzFile gz = (gzFile)gz_handle_map[fd];
+                ret = gzwrite(gz,buf,size);
+                mlog(UT_DAPI, "gzwrite to fd %d -> %p, sz %ld, ret = %ld, erro %d",
+                            fd, &gz, size, ret, errno);
                 if (ret <= 0 && size != 0){
-                    //int gz_error;
-                    //mlog(UT_DAPI, "gzwrite error: %s\n", gzerror(gz, &gz_error));
+                    int gz_error;
+                    mlog(UT_DAPI, "gzwrite error: %s\n", gzerror(gz, &gz_error));
                     ret = (errno==0?-EIO:-errno);
                 }
             }
@@ -744,14 +686,10 @@ int Util::Close( int fd )
             break;
         case GZIP_IO:
             {
-                gzFile gz = gz_handle_map[fd];
-                print_gz(gz,__LINE__);
+                gzFile gz = (gzFile)gz_handle_map[fd];
+                mlog(UT_DAPI, "gzwrite removing fd %d -> %p", fd, &gz);
                 ret = gzclose(gz);
-                mlog(UT_DAPI, "gzwrite removing fd %d ret %d", fd, ret);
-                size_t removed = gz_handle_map.erase(fd);
-                if (removed != 1) {
-                    mlog(UT_DAPI, "gzwrite wtf trying to remove fd %d but couldn't\n", fd);
-                }
+                gz_handle_map.erase(fd);
                 ret = (ret == Z_OK?0:errno==0?-EIO:-errno);
             }
             break;
@@ -766,26 +704,11 @@ int Util::Close( int fd )
 int Util::Creat( const char *path, mode_t mode )
 {
     ENTER_PATH;
-    switch(iotype) {
-        case GNU_IO:
-        case POSIX_IO:
-            ret = creat( path, mode );
-            if ( ret > 0 ) {
-                ret = close(ret);
-            } else {
-                ret = -errno;
-            }
-            break;
-        case GZIP_IO:
-            mlog(UT_DAPI, "gzwrite creating fd from path %s", path);
-            ret = Open(path, O_WRONLY| O_TRUNC | O_CREAT, mode);   
-            if ( ret > 0 ) {
-                ret = Close(ret);
-            } 
-            break;
-        default:
-            ret = -ENOSYS;
-            break;
+    ret = creat( path, mode );
+    if ( ret > 0 ) {
+        ret = close( ret );
+    } else {
+        ret = -errno;
     }
     EXIT_UTIL;
 }
@@ -878,8 +801,6 @@ int Util::Mmap( size_t len, int fd, void **retaddr)
                 if (*retaddr == NULL) {
                     ret = -errno;
                 } else {
-                    off_t result;
-                    Lseek( fd, 0, SEEK_SET, &result);
                     ret = Read(fd,*retaddr,len);
                     if (ret > 0) {
                         ret = 0;
@@ -898,7 +819,6 @@ int Util::Mmap( size_t len, int fd, void **retaddr)
 // returns size or -errno
 size_t gzip_uncompressed_size(FILE *fp) {
     // Look at the first two bytes and make sure it's a gzip file
-    fseek(fp, 0, SEEK_SET);
     int c1 = fgetc(fp);
     int c2 = fgetc(fp);
     if ( c1 != 0x1f || c2 != 0x8b ) {
@@ -924,11 +844,7 @@ size_t gzip_uncompressed_size(FILE *fp) {
     // Copy the last four bytes into an int.  This could also be done
     // using a union.
     int intval = 0;
-    memcpy( &intval, &read, 4 ); 
-
-    if (intval < 0){
-        intval = 0;
-    }
+    memcpy( &intval, &read, 4 );
 
     mlog(UT_DAPI, "gzwrite Found size of gzip file: %ld", (long int)intval);
     return intval;
@@ -936,15 +852,12 @@ size_t gzip_uncompressed_size(FILE *fp) {
 
 size_t gzip_uncompressed_size(int fd) {
     FILE *fp;
-    mlog(UT_DAPI, "gzwrite looking for size of gzip file: %d", fd);
-    off_t incoming_off = lseek(fd,0,SEEK_CUR);
     fp = fdopen(dup(fd), "r"); // dup it so fclose won't close it
     if (fp == NULL) {
         return -errno;
     }
     size_t ret = gzip_uncompressed_size(fp);
     fclose(fp);
-    lseek(fd,incoming_off,SEEK_SET);
     return ret;
 }
 
@@ -980,7 +893,7 @@ int Util::Lseek( int fd, off_t offset, int whence, off_t *result )
                     whence = SEEK_CUR; 
                 }
                 z_off_t off = gzseek(gz, offset, whence);
-                mlog(UT_DAPI, "gzwrite gzseek got %ld", (long int)off);
+                mlog(UT_DAPI, "gzseek got %ld", (long int)off);
                 *result = (off_t)off;
             }
             break;
@@ -993,89 +906,21 @@ int Util::Lseek( int fd, off_t offset, int whence, off_t *result )
     EXIT_UTIL;
 }
 
-string Util::openFlagsToString( int flags )
-{
-    string fstr;
-    if ( flags & O_WRONLY ) {
-        fstr += "|w|";
+// helper function to convert flags for POSIX open
+// into restrict_mode as used in glib fopen
+string
+flags_to_mode(int flags) {
+    if (flags & O_RDONLY || flags == O_RDONLY) {
+        // tougher to check for O_RDONLY since it is 0
+        return "r";
+    } else if (flags & O_WRONLY) {
+        return "w";
+    } else {
+        assert (flags & O_RDWR);
+        return "r+"; 
     }
-    if ( flags & O_RDWR ) {
-        fstr += "|rw|";
-    }
-    if ( flags & O_RDONLY ) {
-        fstr += "|r|";
-    }
-    if ( flags & O_CREAT ) {
-        fstr += "|c|";
-    }
-    if ( flags & O_EXCL ) {
-        fstr += "|e|";
-    }
-    if ( flags & O_TRUNC ) {
-        fstr += "|t|";
-    }
-    if ( flags & O_APPEND ) {
-        fstr += "|a|";
-    }
-    if ( flags & O_NONBLOCK || flags & O_NDELAY ) {
-        fstr += "|n|";
-    }
-    if ( flags & O_SYNC ) {
-        fstr += "|s|";
-    }
-    if ( flags & O_DIRECTORY ) {
-        fstr += "|D|";
-    }
-    if ( flags & O_NOFOLLOW ) {
-        fstr += "|N|";
-    }
-#ifndef __APPLE__
-    if ( flags & O_LARGEFILE ) {
-        fstr += "|l|";
-    }
-    if ( flags & O_DIRECT ) {
-        fstr += "|d|";
-    }
-    if ( flags & O_NOATIME ) {
-        fstr += "|A|";
-    }
-#else
-    if ( flags & O_SHLOCK ) {
-        fstr += "|S|";
-    }
-    if ( flags & O_EXLOCK ) {
-        fstr += "|x|";
-    }
-    if ( flags & O_SYMLINK ) {
-        fstr += "|L|";
-    }
-#endif
-    /*
-    if ( flags & O_ATOMICLOOKUP ) {
-        fstr += "|d|";
-    }
-    */
-    // what the hell is flags: 0x8000
-    if ( flags & 0x8000 ) {
-        fstr += "|8|";
-    }
-    if ( flags & O_CONCURRENT_WRITE ) {
-        fstr += "|cw|";
-    }
-    if ( flags & O_NOCTTY ) {
-        fstr += "|C|";
-    }
-    if ( O_RDONLY == 0 ) { // this is O_RDONLY I think
-        // in the header, O_RDONLY is 00
-        int rdonlymask = 0x0002;
-        if ( (rdonlymask & flags) == 0 ) {
-            fstr += "|R|";
-        }
-    }
-    ostringstream oss;
-    oss << fstr << " (" << flags << ")";
-    fstr = oss.str();
-    return oss.str();
+    assert(0);
+    return "";
 }
 
 int Util::Open( const char *path, int flags )
@@ -1083,12 +928,24 @@ int Util::Open( const char *path, int flags )
     ENTER_PATH;
     // first do the regular open
     int fd = open( path, flags );
+
     switch(iotype) {
         case POSIX_IO:
             ret = fd;
             break;
         case GZIP_IO:
-            ret = gz_open(fd, path, flags);
+            {
+                string mode = flags_to_mode(flags);
+                gzFile gz = gzdopen(fd, mode.c_str());
+                if (gz == Z_NULL) {
+                    ret = -EIO;
+                } else {
+                    pair<map<int,gzFile>::iterator,bool> insert_ret;
+                    insert_ret = gz_handle_map.insert(pair<int,void*>(fd,(void*)&gz));
+                    mlog(UT_DAPI, "gzwrite added fd %d -> %p: %d", fd, &gz, insert_ret.second);
+                    ret = fd; 
+                }
+            }
             break;
         case GNU_IO:
         default:
@@ -1110,7 +967,18 @@ int Util::Open( const char *path, int flags, mode_t mode )
             ret = fd;
             break;
         case GZIP_IO:
-            ret = gz_open(fd, path, flags);
+            {
+                string mode = flags_to_mode(flags);
+                gzFile gz = gzdopen(fd, mode.c_str());
+                if (gz == Z_NULL) {
+                    ret = -EIO;
+                } else {
+                    pair<map<int,gzFile>::iterator,bool> insert_ret;
+                    insert_ret = gz_handle_map.insert(pair<int,void*>(fd,(void*)&gz));
+                    mlog(UT_DAPI, "gzwrite added fd %d -> %p: %d", fd, &gz, insert_ret.second);
+                    ret = fd; 
+                }
+            }
             break;
         case GNU_IO:
         default:
@@ -1250,6 +1118,91 @@ ssize_t Util::Writen( int fd, const void *vptr, size_t n )
         ptr   += nwritten;
     }
     EXIT_UTIL;
+}
+
+string Util::openFlagsToString( int flags )
+{
+    string fstr;
+    if ( flags & O_WRONLY ) {
+        fstr += "w";
+    }
+    if ( flags & O_RDWR ) {
+        fstr += "rw";
+    }
+    if ( flags & O_RDONLY ) {
+        fstr += "r";
+    }
+    if ( flags & O_CREAT ) {
+        fstr += "c";
+    }
+    if ( flags & O_EXCL ) {
+        fstr += "e";
+    }
+    if ( flags & O_TRUNC ) {
+        fstr += "t";
+    }
+    if ( flags & O_APPEND ) {
+        fstr += "a";
+    }
+    if ( flags & O_NONBLOCK || flags & O_NDELAY ) {
+        fstr += "n";
+    }
+    if ( flags & O_SYNC ) {
+        fstr += "s";
+    }
+    if ( flags & O_DIRECTORY ) {
+        fstr += "D";
+    }
+    if ( flags & O_NOFOLLOW ) {
+        fstr += "N";
+    }
+#ifndef __APPLE__
+    if ( flags & O_LARGEFILE ) {
+        fstr += "l";
+    }
+    if ( flags & O_DIRECT ) {
+        fstr += "d";
+    }
+    if ( flags & O_NOATIME ) {
+        fstr += "A";
+    }
+#else
+    if ( flags & O_SHLOCK ) {
+        fstr += "S";
+    }
+    if ( flags & O_EXLOCK ) {
+        fstr += "x";
+    }
+    if ( flags & O_SYMLINK ) {
+        fstr += "L";
+    }
+#endif
+    /*
+    if ( flags & O_ATOMICLOOKUP ) {
+        fstr += "d";
+    }
+    */
+    // what the hell is flags: 0x8000
+    if ( flags & 0x8000 ) {
+        fstr += "8";
+    }
+    if ( flags & O_CONCURRENT_WRITE ) {
+        fstr += "cw";
+    }
+    if ( flags & O_NOCTTY ) {
+        fstr += "c";
+    }
+    if ( O_RDONLY == 0 ) { // this is O_RDONLY I think
+        // in the header, O_RDONLY is 00
+        int rdonlymask = 0x0002;
+        if ( (rdonlymask & flags) == 0 ) {
+            fstr += "r";
+        }
+    }
+    ostringstream oss;
+    oss << fstr << " (" << flags << ")";
+    fstr = oss.str();
+    return oss.str();
 }
 
 /*
