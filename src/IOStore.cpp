@@ -6,6 +6,7 @@
 
 #include "PosixIOStore.h"
 #include "GlibIOStore.h"
+#include "GzIOStore.h"
 
 class PosixIOStore PosixIO;   /* shared for posix access */
 
@@ -53,6 +54,12 @@ class IOStore *plfs_iostore_get(char *phys_path, char **prefixp,
         *prelenp = sizeof("glib:")-1;
         *bmpointp = phys_path + *prelenp;
         return(new GlibIOStore());
+    }
+
+    if (strncmp(phys_path, "gz:", sizeof("gz:")-1) == 0) {
+        *prelenp = sizeof("gz:")-1;
+        *bmpointp = phys_path + *prelenp;
+        return(new GzIOStore());
     }
         
     if (strncmp(phys_path, "hdfs:", sizeof("hdfs:")-1) == 0) {
